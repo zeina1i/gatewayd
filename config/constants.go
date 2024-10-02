@@ -34,11 +34,12 @@ const (
 
 const (
 	// Config constants.
-	Default               = "default"
-	EnvPrefix             = "GATEWAYD_"
-	TracerName            = "gatewayd"
-	GlobalConfigFilename  = "gatewayd.yaml"
-	PluginsConfigFilename = "gatewayd_plugins.yaml"
+	Default                   = "default"
+	DefaultConfigurationBlock = "writes"
+	EnvPrefix                 = "GATEWAYD_"
+	TracerName                = "gatewayd"
+	GlobalConfigFilename      = "gatewayd.yaml"
+	PluginsConfigFilename     = "gatewayd_plugins.yaml"
 
 	// Logger constants.
 	DefaultLogOutput         = "console"
@@ -89,10 +90,12 @@ const (
 	DefaultHealthCheckPeriod = 60 * time.Second // This must match PostgreSQL authentication timeout.
 
 	// Server constants.
-	DefaultListenNetwork    = "tcp"
-	DefaultListenAddress    = "0.0.0.0:15432"
-	DefaultTickInterval     = 5 * time.Second
-	DefaultHandshakeTimeout = 5 * time.Second
+	DefaultListenNetwork         = "tcp"
+	DefaultListenAddress         = "0.0.0.0:15432"
+	DefaultTickInterval          = 5 * time.Second
+	DefaultHandshakeTimeout      = 5 * time.Second
+	DefaultLoadBalancerStrategy  = "ROUND_ROBIN"
+	DefaultLoadBalancerCondition = "DEFAULT"
 
 	// Utility constants.
 	DefaultSeed = 1000
@@ -117,7 +120,17 @@ const (
 	DefaultCompatibilityPolicy = Strict
 
 	// Act.
-	DefaultPolicy        = "passthrough"
-	DefaultPolicyTimeout = 30 * time.Second
-	DefaultActionTimeout = 30 * time.Second
+	DefaultPolicy             = "passthrough"
+	DefaultPolicyTimeout      = 30 * time.Second
+	DefaultActionTimeout      = 30 * time.Second
+	DefaultActionRedisEnabled = false
+	DefaultRedisAddress       = "localhost:6379"
+	DefaultRedisChannel       = "gatewayd-actions"
+)
+
+// Load balancing strategies.
+const (
+	RoundRobinStrategy         = "ROUND_ROBIN"
+	RANDOMStrategy             = "RANDOM"
+	WeightedRoundRobinStrategy = "WEIGHTED_ROUND_ROBIN"
 )

@@ -52,6 +52,10 @@ const (
 	ErrCodeEvalError
 	ErrCodeMsgEncodeError
 	ErrCodeConfigParseError
+	ErrCodePublishAsyncAction
+	ErrCodeLoadBalancerStrategyNotFound
+	ErrCodeNoProxiesAvailable
+	ErrCodeNoLoadBalancerRules
 )
 
 var (
@@ -188,6 +192,21 @@ var (
 
 	ErrConfigParseError = &GatewayDError{
 		ErrCodeConfigParseError, "error parsing config", nil,
+	}
+	ErrPublishingAsyncAction = &GatewayDError{
+		ErrCodePublishAsyncAction, "error publishing async action", nil,
+	}
+
+	ErrLoadBalancerStrategyNotFound = &GatewayDError{
+		ErrCodeLoadBalancerStrategyNotFound, "The specified load balancer strategy does not exist.", nil,
+	}
+
+	ErrNoProxiesAvailable = &GatewayDError{
+		ErrCodeNoProxiesAvailable, "No proxies available to select.", nil,
+	}
+
+	ErrNoLoadBalancerRules = &GatewayDError{
+		ErrCodeNoLoadBalancerRules, "No load balancer rules provided.", nil,
 	}
 
 	// Unwrapped errors.

@@ -13,6 +13,7 @@ import (
 	"github.com/gatewayd-io/gatewayd/network"
 	"github.com/gatewayd-io/gatewayd/plugin"
 	"github.com/gatewayd-io/gatewayd/pool"
+	"github.com/gatewayd-io/gatewayd/testhelpers"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -210,8 +211,8 @@ func TestGetPluginsWithEmptyPluginRegistry(t *testing.T) {
 
 func TestPools(t *testing.T) {
 	api := API{
-		Pools: map[string]*pool.Pool{
-			config.Default: pool.NewPool(context.TODO(), config.EmptyPoolCapacity),
+		Pools: map[string]map[string]*pool.Pool{
+			config.Default: {config.DefaultConfigurationBlock: pool.NewPool(context.TODO(), config.EmptyPoolCapacity)},
 		},
 		ctx: context.Background(),
 	}
@@ -219,12 +220,17 @@ func TestPools(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, pools)
 	assert.NotEmpty(t, pools.AsMap())
-	assert.Equal(t, pools.AsMap()[config.Default], map[string]interface{}{"cap": 0.0, "size": 0.0})
+
+	assert.Equal(t,
+		map[string]any{
+			config.DefaultConfigurationBlock: map[string]any{"cap": 0.0, "size": 0.0},
+		},
+		pools.AsMap()[config.Default])
 }
 
 func TestPoolsWithEmptyPools(t *testing.T) {
 	api := API{
-		Pools: map[string]*pool.Pool{},
+		Pools: map[string]map[string]*pool.Pool{},
 		ctx:   context.Background(),
 	}
 	pools, err := api.GetPools(context.Background(), &emptypb.Empty{})
@@ -234,9 +240,12 @@ func TestPoolsWithEmptyPools(t *testing.T) {
 }
 
 func TestGetProxies(t *testing.T) {
+	postgresHostIP, postgresMappedPort := testhelpers.SetupPostgreSQLTestContainer(context.Background(), t)
+	postgresAddress := postgresHostIP + ":" + postgresMappedPort.Port()
+
 	clientConfig := &config.Client{
 		Network: config.DefaultNetwork,
-		Address: config.DefaultAddress,
+		Address: postgresAddress,
 	}
 	client := network.NewClient(context.TODO(), clientConfig, zerolog.Logger{}, nil)
 	require.NotNil(t, client)
@@ -250,7 +259,7 @@ func TestGetProxies(t *testing.T) {
 			HealthCheckPeriod:    config.DefaultHealthCheckPeriod,
 			ClientConfig: &config.Client{
 				Network: config.DefaultNetwork,
-				Address: config.DefaultAddress,
+				Address: postgresAddress,
 			},
 			Logger:        zerolog.Logger{},
 			PluginTimeout: config.DefaultPluginTimeout,
@@ -258,8 +267,8 @@ func TestGetProxies(t *testing.T) {
 	)
 
 	api := API{
-		Proxies: map[string]*network.Proxy{
-			config.Default: proxy,
+		Proxies: map[string]map[string]*network.Proxy{
+			config.Default: {config.DefaultConfigurationBlock: proxy},
 		},
 		ctx: context.Background(),
 	}
@@ -268,10 +277,14 @@ func TestGetProxies(t *testing.T) {
 	assert.NotEmpty(t, proxies)
 	assert.NotEmpty(t, proxies.AsMap())
 
-	if defaultProxy, ok := proxies.AsMap()[config.Default].(map[string]interface{}); ok {
-		assert.Equal(t, 1.0, defaultProxy["total"])
-		assert.NotEmpty(t, defaultProxy["available"])
-		assert.Empty(t, defaultProxy["busy"])
+	if defaultProxies, ok := proxies.AsMap()[config.Default].(map[string]any); ok {
+		if defaultProxy, ok := defaultProxies[config.DefaultConfigurationBlock].(map[string]any); ok {
+			assert.Equal(t, 1.0, defaultProxy["total"])
+			assert.NotEmpty(t, defaultProxy["available"])
+			assert.Empty(t, defaultProxy["busy"])
+		} else {
+			t.Errorf("proxies.default.%s is not found or not a map", config.DefaultConfigurationBlock)
+		}
 	} else {
 		t.Errorf("proxies.default is not found or not a map")
 	}
@@ -280,9 +293,11 @@ func TestGetProxies(t *testing.T) {
 }
 
 func TestGetServers(t *testing.T) {
+	postgresHostIP, postgresMappedPort := testhelpers.SetupPostgreSQLTestContainer(context.Background(), t)
+	postgresAddress := postgresHostIP + ":" + postgresMappedPort.Port()
 	clientConfig := &config.Client{
 		Network: config.DefaultNetwork,
-		Address: config.DefaultAddress,
+		Address: postgresAddress,
 	}
 	client := network.NewClient(context.TODO(), clientConfig, zerolog.Logger{}, nil)
 	newPool := pool.NewPool(context.TODO(), 1)
@@ -296,7 +311,7 @@ func TestGetServers(t *testing.T) {
 			HealthCheckPeriod:    config.DefaultHealthCheckPeriod,
 			ClientConfig: &config.Client{
 				Network: config.DefaultNetwork,
-				Address: config.DefaultAddress,
+				Address: postgresAddress,
 			},
 			Logger:        zerolog.Logger{},
 			PluginTimeout: config.DefaultPluginTimeout,
@@ -328,25 +343,26 @@ func TestGetServers(t *testing.T) {
 		context.TODO(),
 		network.Server{
 			Network:      config.DefaultNetwork,
-			Address:      config.DefaultAddress,
+			Address:      postgresAddress,
 			TickInterval: config.DefaultTickInterval,
 			Options: network.Option{
 				EnableTicker: false,
 			},
-			Proxy:            proxy,
-			Logger:           zerolog.Logger{},
-			PluginRegistry:   pluginRegistry,
-			PluginTimeout:    config.DefaultPluginTimeout,
-			HandshakeTimeout: config.DefaultHandshakeTimeout,
+			Proxies:                  []network.IProxy{proxy},
+			Logger:                   zerolog.Logger{},
+			PluginRegistry:           pluginRegistry,
+			PluginTimeout:            config.DefaultPluginTimeout,
+			HandshakeTimeout:         config.DefaultHandshakeTimeout,
+			LoadbalancerStrategyName: config.DefaultLoadBalancerStrategy,
 		},
 	)
 
 	api := API{
-		Pools: map[string]*pool.Pool{
-			config.Default: newPool,
+		Pools: map[string]map[string]*pool.Pool{
+			config.Default: {config.DefaultConfigurationBlock: newPool},
 		},
-		Proxies: map[string]*network.Proxy{
-			config.Default: proxy,
+		Proxies: map[string]map[string]*network.Proxy{
+			config.Default: {config.DefaultConfigurationBlock: proxy},
 		},
 		Servers: map[string]*network.Server{
 			config.Default: server,
@@ -360,13 +376,16 @@ func TestGetServers(t *testing.T) {
 
 	if defaultServer, ok := servers.AsMap()[config.Default].(map[string]interface{}); ok {
 		assert.Equal(t, config.DefaultNetwork, defaultServer["network"])
-		assert.Equal(t, config.DefaultAddress, "localhost:5432")
-		status, ok := defaultServer["status"].(float64)
-		assert.True(t, ok)
-		assert.Equal(t, config.Stopped, config.Status(status))
-		tickInterval, ok := defaultServer["tickInterval"].(float64)
-		assert.True(t, ok)
-		assert.Equal(t, config.DefaultTickInterval.Nanoseconds(), int64(tickInterval))
+		statusFloat, isStatusFloat := defaultServer["status"].(float64)
+		assert.True(t, isStatusFloat, "status should be of type float64")
+		status := config.Status(statusFloat)
+		assert.Equal(t, config.Stopped, status)
+		tickIntervalFloat, isTickIntervalFloat := defaultServer["tickInterval"].(float64)
+		assert.True(t, isTickIntervalFloat, "tickInterval should be of type float64")
+		assert.Equal(t, config.DefaultTickInterval.Nanoseconds(), int64(tickIntervalFloat))
+		loadBalancerMap, isLoadBalancerMap := defaultServer["loadBalancer"].(map[string]interface{})
+		assert.True(t, isLoadBalancerMap, "loadBalancer should be a map")
+		assert.Equal(t, config.DefaultLoadBalancerStrategy, loadBalancerMap["strategy"])
 	} else {
 		t.Errorf("servers.default is not found or not a map")
 	}

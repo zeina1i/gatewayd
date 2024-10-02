@@ -2,9 +2,11 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	goerrors "errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"reflect"
 	"sort"
@@ -82,8 +84,10 @@ func (c *Config) InitConfig(ctx context.Context) *gerr.GatewayDError {
 	if err := c.UnmarshalPluginConfig(newCtx); err != nil {
 		return err
 	}
-
 	if err := c.LoadGlobalConfigFile(newCtx); err != nil {
+		return err
+	}
+	if err := c.ConvertKeysToLowercase(newCtx); err != nil {
 		return err
 	}
 	if err := c.ValidateGlobalConfig(newCtx); err != nil {
@@ -160,14 +164,15 @@ func (c *Config) LoadDefaults(ctx context.Context) *gerr.GatewayDError {
 		CertFile:         "",
 		KeyFile:          "",
 		HandshakeTimeout: DefaultHandshakeTimeout,
+		LoadBalancer:     LoadBalancer{Strategy: DefaultLoadBalancerStrategy},
 	}
 
 	c.globalDefaults = GlobalConfig{
 		Loggers: map[string]*Logger{Default: &defaultLogger},
 		Metrics: map[string]*Metrics{Default: &defaultMetric},
-		Clients: map[string]*Client{Default: &defaultClient},
-		Pools:   map[string]*Pool{Default: &defaultPool},
-		Proxies: map[string]*Proxy{Default: &defaultProxy},
+		Clients: map[string]map[string]*Client{Default: {DefaultConfigurationBlock: &defaultClient}},
+		Pools:   map[string]map[string]*Pool{Default: {DefaultConfigurationBlock: &defaultPool}},
+		Proxies: map[string]map[string]*Proxy{Default: {DefaultConfigurationBlock: &defaultProxy}},
 		Servers: map[string]*Server{Default: &defaultServer},
 		API: API{
 			Enabled:     true,
@@ -188,27 +193,59 @@ func (c *Config) LoadDefaults(ctx context.Context) *gerr.GatewayDError {
 		}
 
 		for configObject, configMap := range gconf {
-			if configGroup, ok := configMap.(map[string]interface{}); ok {
-				for configGroupKey := range configGroup {
-					if configGroupKey == Default {
+			configGroup, ok := configMap.(map[string]any)
+			if !ok {
+				err := fmt.Errorf("invalid config structure for %s", configObject)
+				span.RecordError(err)
+				span.End()
+				return gerr.ErrConfigParseError.Wrap(err)
+			}
+
+			if configObject == "api" {
+				// Handle API configuration separately
+				// TODO: Add support for multiple API config groups.
+				continue
+			}
+
+			for configGroupKey, configBlocksInterface := range configGroup {
+				if configGroupKey == Default {
+					continue
+				}
+
+				configBlocks, ok := configBlocksInterface.(map[string]any)
+				if !ok {
+					err := fmt.Errorf("invalid config blocks structure for %s.%s", configObject, configGroupKey)
+					span.RecordError(err)
+					span.End()
+					return gerr.ErrConfigParseError.Wrap(err)
+				}
+
+				for configBlockKey := range configBlocks {
+					if configBlockKey == DefaultConfigurationBlock {
 						continue
 					}
-
 					switch configObject {
 					case "loggers":
 						c.globalDefaults.Loggers[configGroupKey] = &defaultLogger
 					case "metrics":
 						c.globalDefaults.Metrics[configGroupKey] = &defaultMetric
 					case "clients":
-						c.globalDefaults.Clients[configGroupKey] = &defaultClient
+						if c.globalDefaults.Clients[configGroupKey] == nil {
+							c.globalDefaults.Clients[configGroupKey] = make(map[string]*Client)
+						}
+						c.globalDefaults.Clients[configGroupKey][configBlockKey] = &defaultClient
 					case "pools":
-						c.globalDefaults.Pools[configGroupKey] = &defaultPool
+						if c.globalDefaults.Pools[configGroupKey] == nil {
+							c.globalDefaults.Pools[configGroupKey] = make(map[string]*Pool)
+						}
+						c.globalDefaults.Pools[configGroupKey][configBlockKey] = &defaultPool
 					case "proxies":
-						c.globalDefaults.Proxies[configGroupKey] = &defaultProxy
+						if c.globalDefaults.Proxies[configGroupKey] == nil {
+							c.globalDefaults.Proxies[configGroupKey] = make(map[string]*Proxy)
+						}
+						c.globalDefaults.Proxies[configGroupKey][configBlockKey] = &defaultProxy
 					case "servers":
 						c.globalDefaults.Servers[configGroupKey] = &defaultServer
-					case "api":
-						// TODO: Add support for multiple API config groups.
 					default:
 						err := fmt.Errorf("unknown config object: %s", configObject)
 						span.RecordError(err)
@@ -237,6 +274,11 @@ func (c *Config) LoadDefaults(ctx context.Context) *gerr.GatewayDError {
 		PolicyTimeout:       DefaultPolicyTimeout,
 		ActionTimeout:       DefaultActionTimeout,
 		Policies:            []Policy{},
+		ActionRedis: ActionRedisConfig{
+			Enabled: DefaultActionRedisEnabled,
+			Address: DefaultRedisAddress,
+			Channel: DefaultRedisChannel,
+		},
 	}
 
 	if c.GlobalKoanf != nil {
@@ -297,9 +339,40 @@ func (c *Config) LoadPluginEnvVars(ctx context.Context) *gerr.GatewayDError {
 }
 
 func loadEnvVars() *env.Env {
-	return env.Provider(EnvPrefix, ".", func(env string) string {
-		return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(env, EnvPrefix)), "_", ".")
-	})
+	return env.Provider(EnvPrefix, ".", transformEnvVariable)
+}
+
+// transformEnvVariable transforms the environment variable name to a format based on JSON tags.
+func transformEnvVariable(envVar string) string {
+	structs := []interface{}{
+		&API{},
+		&Logger{},
+		&Pool{},
+		&Proxy{},
+		&Server{},
+		&Metrics{},
+		&PluginConfig{},
+	}
+	tagMapping := make(map[string]string)
+	generateTagMapping(structs, tagMapping)
+
+	lowerEnvVar := strings.ToLower(strings.TrimPrefix(envVar, EnvPrefix))
+	parts := strings.Split(lowerEnvVar, "_")
+
+	var transformedParts strings.Builder
+
+	for i, part := range parts {
+		if i > 0 {
+			transformedParts.WriteString(".")
+		}
+		if mappedValue, exists := tagMapping[part]; exists {
+			transformedParts.WriteString(mappedValue)
+		} else {
+			transformedParts.WriteString(part)
+		}
+	}
+
+	return transformedParts.String()
 }
 
 // LoadGlobalConfigFile loads the plugin configuration file.
@@ -396,6 +469,105 @@ func (c *Config) MergeGlobalConfig(
 	return nil
 }
 
+// convertMapKeysToLowercase converts all keys in a map to lowercase.
+//
+// Parameters:
+//   - m: A map with string keys to be converted.
+//
+// Returns:
+//   - map[string]*T: A new map with lowercase keys.
+func convertMapKeysToLowercase[T any](m map[string]*T) map[string]*T {
+	newMap := make(map[string]*T)
+	for k, v := range m {
+		lowercaseKey := strings.ToLower(k)
+		newMap[lowercaseKey] = v
+	}
+	return newMap
+}
+
+// convertNestedMapKeysToLowercase converts all keys in a nested map structure to lowercase.
+//
+// Parameters:
+//   - m: A nested map with string keys to be converted.
+//
+// Returns:
+//   - map[string]map[string]*T: A new nested map with lowercase keys.
+func convertNestedMapKeysToLowercase[T any](m map[string]map[string]*T) map[string]map[string]*T {
+	newMap := make(map[string]map[string]*T)
+	for k, v := range m {
+		lowercaseKey := strings.ToLower(k)
+		newMap[lowercaseKey] = convertMapKeysToLowercase(v)
+	}
+	return newMap
+}
+
+// ConvertKeysToLowercase converts all keys in the global configuration to lowercase.
+// It unmarshals the configuration data into a GlobalConfig struct, then recursively converts
+// all map keys to lowercase.
+//
+// Parameters:
+//   - ctx (context.Context): The context for tracing and cancellation, used for monitoring
+//     and propagating execution state.
+//
+// Returns:
+//   - *gerr.GatewayDError: An error if unmarshalling fails, otherwise nil.
+func (c *Config) ConvertKeysToLowercase(ctx context.Context) *gerr.GatewayDError {
+	_, span := otel.Tracer(TracerName).Start(ctx, "Validate global config")
+
+	defer span.End()
+
+	var globalConfig GlobalConfig
+	if err := c.GlobalKoanf.Unmarshal("", &globalConfig); err != nil {
+		span.RecordError(err)
+		return gerr.ErrValidationFailed.Wrap(
+			fmt.Errorf("failed to unmarshal global configuration: %w", err))
+	}
+
+	globalConfig.Loggers = convertMapKeysToLowercase(globalConfig.Loggers)
+	globalConfig.Clients = convertNestedMapKeysToLowercase(globalConfig.Clients)
+	globalConfig.Pools = convertNestedMapKeysToLowercase(globalConfig.Pools)
+	globalConfig.Proxies = convertNestedMapKeysToLowercase(globalConfig.Proxies)
+	globalConfig.Servers = convertMapKeysToLowercase(globalConfig.Servers)
+	globalConfig.Metrics = convertMapKeysToLowercase(globalConfig.Metrics)
+
+	// Convert the globalConfig back to a map[string]interface{}
+	configMap, err := structToMap(globalConfig)
+	if err != nil {
+		span.RecordError(err)
+		return gerr.ErrValidationFailed.Wrap(
+			fmt.Errorf("failed to convert global configuration to map: %w", err))
+	}
+
+	// Create a new koanf instance and load the updated map
+	newKoanf := koanf.New(".")
+	if err := newKoanf.Load(confmap.Provider(configMap, "."), nil); err != nil {
+		span.RecordError(err)
+		return gerr.ErrValidationFailed.Wrap(
+			fmt.Errorf("failed to load updated configuration into koanf: %w", err))
+	}
+
+	// Update the GlobalKoanf with the new instance
+	c.GlobalKoanf = newKoanf
+	// Update the Global with the new instance
+	c.Global = globalConfig
+
+	return nil
+}
+
+// structToMap converts a given struct to a map[string]interface{}.
+func structToMap(v interface{}) (map[string]interface{}, error) {
+	var result map[string]interface{}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal struct: %w", err)
+	}
+	err = json.Unmarshal(data, &result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data into map: %w", err)
+	}
+	return result, nil
+}
+
 func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 	_, span := otel.Tracer(TracerName).Start(ctx, "Validate global config")
 
@@ -418,6 +590,11 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
 		}
+		if configGroup != strings.ToLower(configGroup) {
+			err := fmt.Errorf(`"logger.%s" is not lowercase`, configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
 	}
 
 	if len(globalConfig.Loggers) > 1 {
@@ -430,17 +607,39 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
 		}
+		if configGroup != strings.ToLower(configGroup) {
+			err := fmt.Errorf(`"metrics.%s" is not lowercase`, configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
 	}
 
 	if len(globalConfig.Metrics) > 1 {
 		seenConfigObjects = append(seenConfigObjects, "metrics")
 	}
 
-	for configGroup := range globalConfig.Clients {
-		if globalConfig.Clients[configGroup] == nil {
-			err := fmt.Errorf("\"clients.%s\" is nil or empty", configGroup)
+	clientConfigGroups := make(map[string]map[string]bool)
+	for configGroupName, configGroups := range globalConfig.Clients {
+		if _, ok := clientConfigGroups[configGroupName]; !ok {
+			clientConfigGroups[configGroupName] = make(map[string]bool)
+		}
+		if configGroupName != strings.ToLower(configGroupName) {
+			err := fmt.Errorf(`"clients.%s" is not lowercase`, configGroupName)
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
+		for configBlockName := range configGroups {
+			clientConfigGroups[configGroupName][configBlockName] = true
+			if globalConfig.Clients[configGroupName][configBlockName] == nil {
+				err := fmt.Errorf(`"clients.%s" is nil or empty`, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
+			if configBlockName != strings.ToLower(configBlockName) {
+				err := fmt.Errorf(`"clients.%s.%s" is not lowercase`, configGroupName, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
 		}
 	}
 
@@ -454,6 +653,11 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
 		}
+		if configGroup != strings.ToLower(configGroup) {
+			err := fmt.Errorf(`"pools.%s" is not lowercase`, configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
 	}
 
 	if len(globalConfig.Pools) > 1 {
@@ -462,7 +666,12 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 
 	for configGroup := range globalConfig.Proxies {
 		if globalConfig.Proxies[configGroup] == nil {
-			err := fmt.Errorf("\"proxies.%s\" is nil or empty", configGroup)
+			err := fmt.Errorf(`"proxies.%s" is nil or empty`, configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
+		if configGroup != strings.ToLower(configGroup) {
+			err := fmt.Errorf(`"proxies.%s" is not lowercase`, configGroup)
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
 		}
@@ -473,8 +682,23 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 	}
 
 	for configGroup := range globalConfig.Servers {
-		if globalConfig.Servers[configGroup] == nil {
+		serverConfig := globalConfig.Servers[configGroup]
+
+		if serverConfig == nil {
 			err := fmt.Errorf("\"servers.%s\" is nil or empty", configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			continue
+		}
+		if configGroup != strings.ToLower(configGroup) {
+			err := fmt.Errorf(`"servers.%s" is not lowercase`, configGroup)
+			span.RecordError(err)
+			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+		}
+
+		// Validate Load Balancing Rules
+		validatelBRulesErrors := ValidateLoadBalancingRules(serverConfig, configGroup, clientConfigGroups)
+		for _, err := range validatelBRulesErrors {
 			span.RecordError(err)
 			errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
 		}
@@ -482,6 +706,46 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 
 	if len(globalConfig.Servers) > 1 {
 		seenConfigObjects = append(seenConfigObjects, "servers")
+	}
+
+	// ValidateClientsPoolsProxies checks if all configGroups in globalConfig.Pools and globalConfig.Proxies
+	// are referenced in globalConfig.Clients.
+	if len(globalConfig.Clients) != len(globalConfig.Pools) || len(globalConfig.Clients) != len(globalConfig.Proxies) {
+		err := goerrors.New("clients, pools, and proxies do not have the same number of objects")
+		span.RecordError(err)
+		errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+	}
+
+	// Check if all proxies are referenced in client configuration
+	for configGroupName, configGroups := range globalConfig.Proxies {
+		for configBlockName := range configGroups {
+			if !clientConfigGroups[configGroupName][configBlockName] {
+				err := fmt.Errorf(`"proxies.%s.%s" not referenced in client configuration`, configGroupName, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
+			if configBlockName != strings.ToLower(configBlockName) {
+				err := fmt.Errorf(`"proxies.%s.%s" is not lowercase`, configGroupName, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
+		}
+	}
+
+	// Check if all pools are referenced in client configuration
+	for configGroupName, configGroups := range globalConfig.Pools {
+		for configBlockName := range configGroups {
+			if !clientConfigGroups[configGroupName][configBlockName] {
+				err := fmt.Errorf(`"pools.%s.%s" not referenced in client configuration`, configGroupName, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
+			if configBlockName != strings.ToLower(configBlockName) {
+				err := fmt.Errorf(`"pools.%s.%s" is not lowercase`, configGroupName, configBlockName)
+				span.RecordError(err)
+				errors = append(errors, gerr.ErrValidationFailed.Wrap(err))
+			}
+		}
 	}
 
 	sort.Strings(seenConfigObjects)
@@ -516,6 +780,141 @@ func (c *Config) ValidateGlobalConfig(ctx context.Context) *gerr.GatewayDError {
 	}
 
 	span.End()
+
+	return nil
+}
+
+// generateTagMapping generates a map of JSON tags to lower case json tags.
+func generateTagMapping(structs []interface{}, tagMapping map[string]string) {
+	for _, s := range structs {
+		structValue := reflect.ValueOf(s).Elem()
+		structType := structValue.Type()
+
+		for i := range structValue.NumField() {
+			field := structType.Field(i)
+			fieldValue := structValue.Field(i)
+
+			// Handle nested structs
+			if field.Type.Kind() == reflect.Struct {
+				generateTagMapping([]interface{}{fieldValue.Addr().Interface()}, tagMapping)
+			}
+
+			jsonTag := field.Tag.Get("json")
+			if jsonTag != "" {
+				tagMapping[strings.ToLower(jsonTag)] = jsonTag
+			} else {
+				tagMapping[strings.ToLower(field.Name)] = strings.ToLower(field.Name)
+			}
+		}
+	}
+}
+
+// ValidateLoadBalancingRules validates the load balancing rules in the server configuration.
+func ValidateLoadBalancingRules(
+	serverConfig *Server,
+	configGroup string,
+	clientConfigGroups map[string]map[string]bool,
+) []error {
+	var errors []error
+
+	// Return early if there are no load balancing rules
+	if serverConfig.LoadBalancer.LoadBalancingRules == nil {
+		return errors
+	}
+
+	// Validate each load balancing rule
+	for _, rule := range serverConfig.LoadBalancer.LoadBalancingRules {
+		// Validate the condition of the rule
+		if err := validateRuleCondition(rule.Condition, configGroup); err != nil {
+			errors = append(errors, err)
+		}
+
+		// Validate the distribution of the rule
+		if err := validateDistribution(
+			rule.Distribution,
+			configGroup,
+			rule.Condition,
+			clientConfigGroups,
+		); err != nil {
+			errors = append(errors, err)
+		}
+	}
+
+	return errors
+}
+
+// validateRuleCondition checks if the rule condition is empty for LoadBalancingRules.
+func validateRuleCondition(condition string, configGroup string) error {
+	if condition == "" {
+		err := fmt.Errorf(`"servers.%s.loadBalancer.loadBalancingRules.condition" is nil or empty`, configGroup)
+		return err
+	}
+	return nil
+}
+
+// validateDistribution checks if the distribution list is valid for LoadBalancingRules.
+func validateDistribution(
+	distributionList []Distribution,
+	configGroup string,
+	condition string,
+	clientConfigGroups map[string]map[string]bool,
+) error {
+	// Check if the distribution list is empty
+	if len(distributionList) == 0 {
+		return fmt.Errorf(
+			`"servers.%s.loadBalancer.loadBalancingRules.distribution" is empty`,
+			configGroup,
+		)
+	}
+
+	var totalWeight int
+	for _, distribution := range distributionList {
+		// Validate each distribution entry
+		if err := validateDistributionEntry(distribution, configGroup, condition, clientConfigGroups); err != nil {
+			return err
+		}
+
+		// Check if adding the weight would exceed the maximum integer value
+		if totalWeight > math.MaxInt-distribution.Weight {
+			return fmt.Errorf(
+				`"servers.%s.loadBalancer.loadBalancingRules.%s" total weight exceeds maximum int value`,
+				configGroup,
+				condition,
+			)
+		}
+
+		totalWeight += distribution.Weight
+	}
+
+	return nil
+}
+
+// validateDistributionEntry validates a single distribution entry for LoadBalancingRules.
+func validateDistributionEntry(
+	distribution Distribution,
+	configGroup string,
+	condition string,
+	clientConfigGroups map[string]map[string]bool,
+) error {
+	// Check if the distribution.ProxyName is referenced in the proxy configuration
+	if !clientConfigGroups[configGroup][distribution.ProxyName] {
+		return fmt.Errorf(
+			`"servers.%s.loadBalancer.loadBalancingRules.%s.%s" not referenced in proxy configuration`,
+			configGroup,
+			condition,
+			distribution.ProxyName,
+		)
+	}
+
+	// Ensure that the distribution weight is positive
+	if distribution.Weight <= 0 {
+		return fmt.Errorf(
+			`"servers.%s.loadBalancer.loadBalancingRules.%s.%s.weight" must be positive`,
+			configGroup,
+			condition,
+			distribution.ProxyName,
+		)
+	}
 
 	return nil
 }

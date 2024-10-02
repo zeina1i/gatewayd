@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/knadh/koanf"
@@ -141,4 +143,117 @@ func TestMergeGlobalConfig(t *testing.T) {
 	assert.NotEqual(t, GlobalConfig{}, config.Global)
 	// The log level should now be debug.
 	assert.Equal(t, "debug", config.Global.Loggers[Default].Level)
+}
+
+// initializeConfig initializes the configuration with the given context.
+// It returns a pointer to the Config struct. If configuration initialization fails,
+// the test will fail with an error message.
+func initializeConfig(ctx context.Context, t *testing.T) *Config {
+	t.Helper()
+	config := NewConfig(ctx, Config{
+		GlobalConfigFile: parentDir + GlobalConfigFilename,
+		PluginConfigFile: parentDir + PluginsConfigFilename,
+	})
+	err := config.InitConfig(ctx)
+	require.Nil(t, err)
+	return config
+}
+
+// serverLoadBalancerStrategyOverwrite sets the environment variable for server nested configuration
+// and verifies that the configuration is correctly loaded with the expected value.
+func ServerLoadBalancerStrategyOverwrite(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	// Convert to uppercase
+	upperDefaultGroup := strings.ToUpper(Default)
+
+	// Format environment variable name
+	envVarName := fmt.Sprintf("GATEWAYD_SERVERS_%s_LOADBALANCER_STRATEGY", upperDefaultGroup)
+
+	// Set the environment variable
+	t.Setenv(envVarName, "test")
+	config := initializeConfig(ctx, t)
+	assert.Equal(t, "test", config.Global.Servers[Default].LoadBalancer.Strategy)
+}
+
+// pluginDefaultPolicyOverwrite sets the environment variable for plugin configuration
+// and verifies that the configuration is correctly loaded with the expected value.
+func pluginDefaultPolicyOverwrite(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Set the environment variable
+	t.Setenv("GATEWAYD_DEFAULTPOLICY", "test")
+	config := initializeConfig(ctx, t)
+	assert.Equal(t, "test", config.Plugin.DefaultPolicy)
+}
+
+// clientNetworkOverwrite sets the environment variable for client network configuration
+// and verifies that the configuration is correctly loaded with the expected value.
+func clientNetworkOverwrite(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	// Convert to uppercase
+	upperDefaultGroup := strings.ToUpper(Default)
+	upperDefaultBlock := strings.ToUpper(DefaultConfigurationBlock)
+
+	// Format environment variable name
+	envVarName := fmt.Sprintf("GATEWAYD_CLIENTS_%s_%s_NETWORK", upperDefaultGroup, upperDefaultBlock)
+
+	// Set the environment variable
+	t.Setenv(envVarName, "udp")
+	config := initializeConfig(ctx, t)
+	assert.Equal(t, "udp", config.Global.Clients[Default][DefaultConfigurationBlock].Network)
+}
+
+// serverNetworkOverwrite sets the environment variable for server network configuration
+// and verifies that the configuration is correctly loaded with the expected value.
+func serverNetworkOverwrite(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	// Convert to uppercase
+	upperDefaultGroup := strings.ToUpper(Default)
+
+	// Format environment variable name
+	envVarName := fmt.Sprintf("GATEWAYD_SERVERS_%s_NETWORK", upperDefaultGroup)
+
+	// Set the environment variable
+	t.Setenv(envVarName, "udp")
+	config := initializeConfig(ctx, t)
+	assert.Equal(t, "udp", config.Global.Servers[Default].Network)
+}
+
+// TestLoadEnvVariables runs a suite of tests to verify that environment variables are correctly
+// loaded into the configuration. Each test scenario sets a specific environment variable and
+// checks if the configuration reflects the expected value.
+func TestLoadEnvVariables(t *testing.T) {
+	scenarios := map[string]func(t *testing.T){
+		"serverLoadBalancerStrategyOverwrite": ServerLoadBalancerStrategyOverwrite,
+		"pluginLocalPathOverwrite":            pluginDefaultPolicyOverwrite,
+		"ClientNetworkOverwrite":              clientNetworkOverwrite,
+		"ServerNetworkOverwrite":              serverNetworkOverwrite,
+	}
+
+	for scenario, fn := range scenarios {
+		t.Run(scenario, func(t *testing.T) {
+			fn(t)
+		})
+	}
+}
+
+// TestConvertKeysToLowercaseSuccess verifies that after calling ConvertKeysToLowercase,
+// all keys in the config.Global.Clients map are converted to lowercase.
+func TestConvertKeysToLowercaseSuccess(t *testing.T) {
+	ctx := context.Background()
+	config := NewConfig(ctx,
+		Config{GlobalConfigFile: parentDir + GlobalConfigFilename, PluginConfigFile: parentDir + PluginsConfigFilename})
+
+	err := config.ConvertKeysToLowercase(ctx)
+	require.Nil(t, err)
+	for configurationGroupName, configurationGroup := range config.Global.Clients {
+		assert.Equal(t, configurationGroupName, strings.ToLower(configurationGroupName))
+		for configuraionBlockName := range configurationGroup {
+			assert.Equal(t, configuraionBlockName, strings.ToLower(configuraionBlockName))
+		}
+	}
 }

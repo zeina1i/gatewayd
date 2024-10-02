@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sdkAct "github.com/gatewayd-io/gatewayd-plugin-sdk/act"
+	"github.com/gatewayd-io/gatewayd-plugin-sdk/databases/postgres"
 	v1 "github.com/gatewayd-io/gatewayd-plugin-sdk/plugin/v1"
 	"github.com/gatewayd-io/gatewayd/act"
 	"github.com/gatewayd-io/gatewayd/config"
@@ -25,6 +26,7 @@ import (
 	"golang.org/x/exp/maps"
 )
 
+//nolint:interfacebloat
 type IProxy interface {
 	Connect(conn *ConnWrapper) *gerr.GatewayDError
 	Disconnect(conn *ConnWrapper) *gerr.GatewayDError
@@ -35,9 +37,13 @@ type IProxy interface {
 	Shutdown()
 	AvailableConnectionsString() []string
 	BusyConnectionsString() []string
+	GetGroupName() string
+	GetBlockName() string
 }
 
 type Proxy struct {
+	GroupName            string
+	BlockName            string
 	AvailableConnections pool.IPool
 	busyConnections      pool.IPool
 	Logger               zerolog.Logger
@@ -62,6 +68,8 @@ func NewProxy(
 	defer span.End()
 
 	proxy := Proxy{
+		GroupName:            pxy.GroupName,
+		BlockName:            pxy.BlockName,
 		AvailableConnections: pxy.AvailableConnections,
 		busyConnections:      pool.NewPool(proxyCtx, config.EmptyPoolCapacity),
 		Logger:               pxy.Logger,
@@ -115,7 +123,8 @@ func NewProxy(
 			})
 			proxy.Logger.Trace().Str("duration", time.Since(now).String()).Msg(
 				"Finished the client health check")
-			metrics.ProxyHealthChecks.Inc()
+			metrics.ProxyHealthChecks.WithLabelValues(
+				proxy.GetGroupName(), proxy.GetBlockName()).Inc()
 		},
 	); err != nil {
 		proxy.Logger.Error().Err(err).Msg("Failed to schedule the client health check")
@@ -133,6 +142,14 @@ func NewProxy(
 	).Msg("Started the client health check scheduler")
 
 	return &proxy
+}
+
+func (pr *Proxy) GetBlockName() string {
+	return pr.BlockName
+}
+
+func (pr *Proxy) GetGroupName() string {
+	return pr.GroupName
 }
 
 // Connect maps a server connection from the available connection pool to a incoming connection.
@@ -174,7 +191,7 @@ func (pr *Proxy) Connect(conn *ConnWrapper) *gerr.GatewayDError {
 		return err
 	}
 
-	metrics.ProxiedConnections.Inc()
+	metrics.ProxiedConnections.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
 
 	fields := map[string]interface{}{
 		"function": "proxy.connect",
@@ -237,7 +254,7 @@ func (pr *Proxy) Disconnect(conn *ConnWrapper) *gerr.GatewayDError {
 		return gerr.ErrCastFailed
 	}
 
-	metrics.ProxiedConnections.Dec()
+	metrics.ProxiedConnections.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Dec()
 
 	pr.Logger.Debug().Fields(
 		map[string]interface{}{
@@ -315,7 +332,7 @@ func (pr *Proxy) PassThroughToServer(conn *ConnWrapper, stack *Stack) *gerr.Gate
 
 	// Check if the client sent a SSL request and the server supports SSL.
 	//nolint:nestif
-	if conn.IsTLSEnabled() && IsPostgresSSLRequest(request) {
+	if conn.IsTLSEnabled() && postgres.IsPostgresSSLRequest(request) {
 		// Perform TLS handshake.
 		if err := conn.UpgradeToTLS(func(net.Conn) {
 			// Acknowledge the SSL request:
@@ -347,7 +364,7 @@ func (pr *Proxy) PassThroughToServer(conn *ConnWrapper, stack *Stack) *gerr.Gate
 				},
 			).Msg("Performed the TLS handshake")
 			span.AddEvent("Performed the TLS handshake")
-			metrics.TLSConnections.Inc()
+			metrics.TLSConnections.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
 		} else {
 			pr.Logger.Error().Fields(
 				map[string]interface{}{
@@ -361,7 +378,7 @@ func (pr *Proxy) PassThroughToServer(conn *ConnWrapper, stack *Stack) *gerr.Gate
 		// This return causes the client to start sending
 		// StartupMessage over the TLS connection.
 		return nil
-	} else if !conn.IsTLSEnabled() && IsPostgresSSLRequest(request) {
+	} else if !conn.IsTLSEnabled() && postgres.IsPostgresSSLRequest(request) {
 		// Client sent a SSL request, but the server does not support SSL.
 
 		pr.Logger.Warn().Fields(
@@ -403,10 +420,10 @@ func (pr *Proxy) PassThroughToServer(conn *ConnWrapper, stack *Stack) *gerr.Gate
 		}
 
 		if modResponse, modReceived := pr.getPluginModifiedResponse(result); modResponse != nil {
-			metrics.ProxyPassThroughsToClient.Inc()
-			metrics.ProxyPassThroughTerminations.Inc()
-			metrics.BytesSentToClient.Observe(float64(modReceived))
-			metrics.TotalTrafficBytes.Observe(float64(modReceived))
+			metrics.ProxyPassThroughsToClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
+			metrics.ProxyPassThroughTerminations.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
+			metrics.BytesSentToClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(modReceived))
+			metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(modReceived))
 
 			span.AddEvent("Terminating connection")
 
@@ -453,7 +470,7 @@ func (pr *Proxy) PassThroughToServer(conn *ConnWrapper, stack *Stack) *gerr.Gate
 	}
 	span.AddEvent("Ran the OnTrafficToServer hooks")
 
-	metrics.ProxyPassThroughsToServer.Inc()
+	metrics.ProxyPassThroughsToServer.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
 
 	return nil
 }
@@ -487,8 +504,17 @@ func (pr *Proxy) PassThroughToClient(conn *ConnWrapper, stack *Stack) *gerr.Gate
 	received, response, err := pr.receiveTrafficFromServer(client)
 	span.AddEvent("Received traffic from server")
 
-	// If the response is empty, don't send anything, instead just close the ingress connection.
-	if received == 0 || err != nil {
+	// If there is no data to send to the client,
+	// we don't need to run the hooks and
+	// we obviously have no data to send to the client.
+	if received == 0 {
+		span.AddEvent("No data to send to client")
+		stack.PopLastRequest()
+		return nil
+	}
+
+	// If there is an error, close the ingress connection.
+	if err != nil {
 		fields := map[string]interface{}{"function": "proxy.passthrough"}
 		if client.LocalAddr() != "" {
 			fields["localAddr"] = client.LocalAddr()
@@ -510,7 +536,7 @@ func (pr *Proxy) PassThroughToClient(conn *ConnWrapper, stack *Stack) *gerr.Gate
 
 	// Get the last request from the stack.
 	lastRequest := stack.PopLastRequest()
-	request := make([]byte, 0)
+	request := []byte{}
 	if lastRequest != nil {
 		request = lastRequest.Data
 	}
@@ -581,7 +607,7 @@ func (pr *Proxy) PassThroughToClient(conn *ConnWrapper, stack *Stack) *gerr.Gate
 		span.RecordError(errVerdict)
 	}
 
-	metrics.ProxyPassThroughsToClient.Inc()
+	metrics.ProxyPassThroughsToClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Inc()
 
 	return errVerdict
 }
@@ -653,7 +679,8 @@ func (pr *Proxy) Shutdown() {
 	pr.Logger.Debug().Msg("All busy connections have been closed")
 }
 
-// AvailableConnectionsString returns a list of available connections.
+// AvailableConnectionsString returns a list of available connections. This list enumerates
+// the local addresses of the outgoing connections to the server.
 func (pr *Proxy) AvailableConnectionsString() []string {
 	_, span := otel.Tracer(config.TracerName).Start(pr.ctx, "AvailableConnections")
 	defer span.End()
@@ -668,15 +695,16 @@ func (pr *Proxy) AvailableConnectionsString() []string {
 	return connections
 }
 
-// BusyConnectionsString returns a list of busy connections.
+// BusyConnectionsString returns a list of busy connections. This list enumerates
+// the remote addresses of the incoming connections from a database client like psql.
 func (pr *Proxy) BusyConnectionsString() []string {
 	_, span := otel.Tracer(config.TracerName).Start(pr.ctx, "BusyConnectionsString")
 	defer span.End()
 
 	connections := make([]string, 0)
 	pr.busyConnections.ForEach(func(key, _ interface{}) bool {
-		if conn, ok := key.(net.Conn); ok {
-			connections = append(connections, RemoteAddr(conn))
+		if conn, ok := key.(*ConnWrapper); ok {
+			connections = append(connections, RemoteAddr(conn.Conn()))
 		}
 		return true
 	})
@@ -689,7 +717,7 @@ func (pr *Proxy) receiveTrafficFromClient(conn net.Conn) ([]byte, *gerr.GatewayD
 	defer span.End()
 
 	// request contains the data from the client.
-	received := 0
+	total := 0
 	buffer := bytes.NewBuffer(nil)
 	for {
 		chunk := make([]byte, pr.ClientConfig.ReceiveChunkSize)
@@ -698,16 +726,16 @@ func (pr *Proxy) receiveTrafficFromClient(conn net.Conn) ([]byte, *gerr.GatewayD
 			pr.Logger.Debug().Err(err).Msg("Error reading from client")
 			span.RecordError(err)
 
-			metrics.BytesReceivedFromClient.Observe(float64(read))
-			metrics.TotalTrafficBytes.Observe(float64(read))
+			metrics.BytesReceivedFromClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(read))
+			metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(read))
 
 			return chunk[:read], gerr.ErrReadFailed.Wrap(err)
 		}
 
-		received += read
+		total += read
 		buffer.Write(chunk[:read])
 
-		if received == 0 || received < pr.ClientConfig.ReceiveChunkSize {
+		if read < pr.ClientConfig.ReceiveChunkSize {
 			break
 		}
 
@@ -716,10 +744,9 @@ func (pr *Proxy) receiveTrafficFromClient(conn net.Conn) ([]byte, *gerr.GatewayD
 		}
 	}
 
-	length := len(buffer.Bytes())
 	pr.Logger.Debug().Fields(
 		map[string]interface{}{
-			"length": length,
+			"length": total,
 			"local":  LocalAddr(conn),
 			"remote": RemoteAddr(conn),
 		},
@@ -727,8 +754,8 @@ func (pr *Proxy) receiveTrafficFromClient(conn net.Conn) ([]byte, *gerr.GatewayD
 
 	span.AddEvent("Received data from client")
 
-	metrics.BytesReceivedFromClient.Observe(float64(length))
-	metrics.TotalTrafficBytes.Observe(float64(length))
+	metrics.BytesReceivedFromClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(total))
+	metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(total))
 
 	return buffer.Bytes(), nil
 }
@@ -760,8 +787,8 @@ func (pr *Proxy) sendTrafficToServer(client *Client, request []byte) (int, *gerr
 
 	span.AddEvent("Sent data to database")
 
-	metrics.BytesSentToServer.Observe(float64(sent))
-	metrics.TotalTrafficBytes.Observe(float64(sent))
+	metrics.BytesSentToServer.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(sent))
+	metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(sent))
 
 	return sent, err
 }
@@ -789,8 +816,8 @@ func (pr *Proxy) receiveTrafficFromServer(client *Client) (int, []byte, *gerr.Ga
 
 	span.AddEvent("Received data from database")
 
-	metrics.BytesReceivedFromServer.Observe(float64(received))
-	metrics.TotalTrafficBytes.Observe(float64(received))
+	metrics.BytesReceivedFromServer.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(received))
+	metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(received))
 
 	return received, response, err
 }
@@ -830,8 +857,8 @@ func (pr *Proxy) sendTrafficToClient(
 
 	span.AddEvent("Sent data to client")
 
-	metrics.BytesSentToClient.Observe(float64(received))
-	metrics.TotalTrafficBytes.Observe(float64(received))
+	metrics.BytesSentToClient.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(received))
+	metrics.TotalTrafficBytes.WithLabelValues(pr.GetGroupName(), pr.GetBlockName()).Observe(float64(received))
 
 	return nil
 }
@@ -856,31 +883,35 @@ func (pr *Proxy) shouldTerminate(result map[string]interface{}) (bool, map[strin
 	// The Terminal field is only present if the action wants to terminate the request,
 	// that is the `__terminal__` field is set in one of the outputs.
 	keys := maps.Keys(result)
-	if slices.Contains(keys, sdkAct.Terminal) {
-		var actionResult map[string]interface{}
-		for _, output := range outputs {
-			actRes, err := pr.PluginRegistry.ActRegistry.Run(
-				output, act.WithResult(result))
-			// If the action is async and we received a sentinel error,
-			// don't log the error.
-			if err != nil && !errors.Is(err, gerr.ErrAsyncAction) {
-				pr.Logger.Error().Err(err).Msg("Error running policy")
-			}
-			// The terminate action should return a map.
-			if v, ok := actRes.(map[string]interface{}); ok {
-				actionResult = v
-			}
+	terminate := slices.Contains(keys, sdkAct.Terminal) && cast.ToBool(result[sdkAct.Terminal])
+	actionResult := make(map[string]interface{})
+	for _, output := range outputs {
+		if !cast.ToBool(output.Verdict) {
+			pr.Logger.Debug().Msg(
+				"Skipping the action, because the verdict of the policy execution is false")
+			continue
 		}
+		actRes, err := pr.PluginRegistry.ActRegistry.Run(
+			output, act.WithResult(result))
+		// If the action is async and we received a sentinel error,
+		// don't log the error.
+		if err != nil && !errors.Is(err, gerr.ErrAsyncAction) {
+			pr.Logger.Error().Err(err).Msg("Error running policy")
+		}
+		// The terminate action should return a map.
+		if v, ok := actRes.(map[string]interface{}); ok {
+			actionResult = v
+		}
+	}
+	if terminate {
 		pr.Logger.Debug().Fields(
 			map[string]interface{}{
 				"function": "proxy.passthrough",
 				"reason":   "terminate",
 			},
 		).Msg("Terminating request")
-		return cast.ToBool(result[sdkAct.Terminal]), actionResult
 	}
-
-	return false, result
+	return terminate, actionResult
 }
 
 // getPluginModifiedRequest is a function that retrieves the modified request

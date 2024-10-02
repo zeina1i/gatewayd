@@ -11,25 +11,17 @@ linters:
     - nlreturn
     - testpackage
     - paralleltest
-    - exhaustivestruct
     - exhaustruct
     - gocognit
     - gochecknoinits
     - gocyclo
-    - maligned
     - funlen
     - maintidx
     - musttag
-    - nosnakecase
-    - goerr113
-    - ifshort
-    - deadcode
-    - interfacer
-    - scopelint
-    - structcheck
-    - varcheck
-    - golint
+    - err113
     - testifylint
+    - fatcontext
+    - gomoddirectives
 linters-settings:
   depguard:
     rules:
@@ -73,7 +65,11 @@ linters-settings:
           - "github.com/cybercyst/go-scaffold/pkg/scaffold"
           - "golang.org/x/text/cases"
           - "golang.org/x/text/language"
-          - "gopkg.in/yaml.v2"
+          - "github.com/redis/go-redis/v9"
+          - "github.com/spaolacci/murmur3"
+          - "github.com/testcontainers/testcontainers-go"
+          - "github.com/stretchr/testify/require"
+          - "github.com/docker/go-connections/nat"
       test:
         files:
           - $test
@@ -92,6 +88,9 @@ linters-settings:
           - "github.com/knadh/koanf"
           - "github.com/spf13/cast"
           - "github.com/jackc/pgx/v5/pgproto3"
+          - "github.com/testcontainers/testcontainers-go"
+          - "github.com/redis/go-redis/v9"
+          - "github.com/docker/go-connections/nat"
   tagalign:
     align: false
     sort: false

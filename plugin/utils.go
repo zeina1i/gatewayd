@@ -42,6 +42,11 @@ func castToPrimitiveTypes(args map[string]interface{}) map[string]interface{} {
 				}
 			}
 			args[key] = array
+		case map[string]map[string]any:
+			for _, valuemap := range value {
+				// Recursively cast nested maps.
+				args[key] = castToPrimitiveTypes(valuemap)
+			}
 		// TODO: Add more types here as needed.
 		default:
 			args[key] = value
@@ -76,7 +81,10 @@ func getSignals(result map[string]any) []sdkAct.Signal {
 
 // applyPolicies applies the policies to the signals and returns the outputs.
 func applyPolicies(
-	hookName string, signals []sdkAct.Signal, logger zerolog.Logger, reg act.IRegistry,
+	hook sdkAct.Hook,
+	signals []sdkAct.Signal,
+	logger zerolog.Logger,
+	reg act.IRegistry,
 ) []*sdkAct.Output {
 	signalNames := []string{}
 	for _, signal := range signals {
@@ -85,15 +93,15 @@ func applyPolicies(
 
 	logger.Debug().Fields(
 		map[string]interface{}{
-			"hook":    hookName,
+			"hook":    hook.Name,
 			"signals": signalNames,
 		},
 	).Msg("Detected signals from the plugin hook")
 
-	outputs := reg.Apply(signals)
+	outputs := reg.Apply(signals, hook)
 	logger.Debug().Fields(
 		map[string]interface{}{
-			"hook":    hookName,
+			"hook":    hook.Name,
 			"outputs": outputs,
 		},
 	).Msg("Applied policies to signals")

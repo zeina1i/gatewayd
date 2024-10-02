@@ -1,9 +1,14 @@
 package act
 
 import (
+	"context"
+	"testing"
 	"time"
 
 	sdkAct "github.com/gatewayd-io/gatewayd-plugin-sdk/act"
+	"github.com/stretchr/testify/assert"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func createWaitActEntities(async bool) (
@@ -48,4 +53,30 @@ func createWaitActEntities(async bool) (
 	}
 
 	return name, actions, signals, policy
+}
+
+func createTestRedis(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+
+	req := testcontainers.ContainerRequest{
+		Image:        "redis:6",
+		ExposedPorts: []string{"6379/tcp"},
+		WaitingFor:   wait.ForLog("Ready to accept connections"),
+	}
+	redisContainer, err := testcontainers.GenericContainer(
+		ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: req,
+			Started:          true,
+		},
+	)
+	assert.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, redisContainer.Terminate(ctx))
+	})
+	host, err := redisContainer.Host(ctx)
+	assert.NoError(t, err)
+	port, err := redisContainer.MappedPort(ctx, "6379/tcp")
+	assert.NoError(t, err)
+	return host + ":" + port.Port()
 }

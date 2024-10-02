@@ -1,12 +1,24 @@
 package network
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gatewayd-io/gatewayd/config"
+	gerr "github.com/gatewayd-io/gatewayd/errors"
+	"github.com/gatewayd-io/gatewayd/logging"
+	"github.com/gatewayd-io/gatewayd/plugin"
+	"github.com/gatewayd-io/gatewayd/pool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -14,6 +26,11 @@ type WriteBuffer struct {
 	Bytes []byte
 
 	msgStart int
+}
+
+// MockProxy implements the IProxy interface for testing purposes.
+type MockProxy struct {
+	name string
 }
 
 // writeStartupMsg writes a PostgreSQL startup message to the buffer.
@@ -36,7 +53,7 @@ func writeStartupMsg(buf *WriteBuffer, user, database, appName string) {
 
 	// Write message length
 	binary.BigEndian.PutUint32(
-		buf.Bytes[buf.msgStart:], uint32(len(buf.Bytes)-buf.msgStart))
+		buf.Bytes[buf.msgStart:], uint32(len(buf.Bytes)-buf.msgStart)) //nolint:gosec
 }
 
 // WriteString writes a null-terminated string to the buffer.
@@ -50,7 +67,7 @@ func CreatePostgreSQLPacket(typ byte, msg []byte) []byte {
 	packet := make([]byte, 1+4+len(msg))
 
 	packet[0] = typ
-	binary.BigEndian.PutUint32(packet[1:], uint32(len(msg)+4))
+	binary.BigEndian.PutUint32(packet[1:], uint32(len(msg)+4)) //nolint:gosec
 	for i, b := range msg {
 		packet[i+5] = b
 	}
@@ -153,4 +170,195 @@ func CollectAndComparePrometheusMetrics(t *testing.T) {
 	)
 	require.NoError(t,
 		testutil.GatherAndCompare(prometheus.DefaultGatherer, strings.NewReader(want), metrics...))
+}
+
+// CreateNewClient creates a new client for testing.
+func CreateNewClient(
+	ctx context.Context,
+	t *testing.T,
+	clientIP,
+	clientPort string,
+	logger *zerolog.Logger,
+) (*Client, *config.Client) {
+	t.Helper()
+
+	if logger == nil {
+		newLogger := logging.NewLogger(ctx, logging.LoggerConfig{
+			Output:            []config.LogOutput{config.Console},
+			TimeFormat:        zerolog.TimeFormatUnix,
+			ConsoleTimeFormat: time.RFC3339,
+			Level:             zerolog.DebugLevel,
+			NoColor:           true,
+		})
+		logger = &newLogger
+	}
+
+	clientConfig := config.Client{
+		Network:            "tcp",
+		Address:            clientIP + ":" + clientPort,
+		ReceiveChunkSize:   config.DefaultChunkSize,
+		ReceiveDeadline:    config.DefaultReceiveDeadline,
+		SendDeadline:       config.DefaultSendDeadline,
+		TCPKeepAlive:       false,
+		TCPKeepAlivePeriod: config.DefaultTCPKeepAlivePeriod,
+	}
+
+	client := NewClient(
+		ctx,
+		&clientConfig,
+		*logger,
+		nil)
+
+	return client, &clientConfig
+}
+
+// setupProxy initializes a connection pool and creates a proxy.
+func setupProxy(
+	ctx context.Context,
+	t *testing.T,
+	clientIP,
+	clientPort string,
+	logger zerolog.Logger,
+	pluginRegistry *plugin.Registry,
+) *Proxy {
+	t.Helper()
+	connectionPool := pool.NewPool(ctx, 3)
+
+	var clientConfig *config.Client
+	var client *Client
+	for range 3 {
+		client, clientConfig = CreateNewClient(ctx, t, clientIP, clientPort, &logger)
+		err := connectionPool.Put(client.ID, client)
+		assert.Nil(t, err)
+	}
+
+	proxy := NewProxy(
+		ctx,
+		Proxy{
+			AvailableConnections: connectionPool,
+			PluginRegistry:       pluginRegistry,
+			HealthCheckPeriod:    config.DefaultHealthCheckPeriod,
+			ClientConfig:         clientConfig,
+			Logger:               logger,
+			PluginTimeout:        config.DefaultPluginTimeout,
+		},
+	)
+
+	return proxy
+}
+
+// Connect is a mock implementation of the Connect method in the IProxy interface.
+func (m MockProxy) Connect(_ *ConnWrapper) *gerr.GatewayDError {
+	return nil
+}
+
+// Disconnect is a mock implementation of the Disconnect method in the IProxy interface.
+func (m MockProxy) Disconnect(_ *ConnWrapper) *gerr.GatewayDError {
+	return nil
+}
+
+// PassThroughToServer is a mock implementation of the PassThroughToServer method in the IProxy interface.
+func (m MockProxy) PassThroughToServer(_ *ConnWrapper, _ *Stack) *gerr.GatewayDError {
+	return nil
+}
+
+// PassThroughToClient is a mock implementation of the PassThroughToClient method in the IProxy interface.
+func (m MockProxy) PassThroughToClient(_ *ConnWrapper, _ *Stack) *gerr.GatewayDError {
+	return nil
+}
+
+// IsHealthy is a mock implementation of the IsHealthy method in the IProxy interface.
+func (m MockProxy) IsHealthy(_ *Client) (*Client, *gerr.GatewayDError) {
+	return nil, nil
+}
+
+// IsExhausted is a mock implementation of the IsExhausted method in the IProxy interface.
+func (m MockProxy) IsExhausted() bool {
+	return false
+}
+
+// Shutdown is a mock implementation of the Shutdown method in the IProxy interface.
+func (m MockProxy) Shutdown() {}
+
+// AvailableConnectionsString is a mock implementation of the AvailableConnectionsString method in the IProxy interface.
+func (m MockProxy) AvailableConnectionsString() []string {
+	return nil
+}
+
+// BusyConnectionsString is a mock implementation of the BusyConnectionsString method in the IProxy interface.
+func (m MockProxy) BusyConnectionsString() []string {
+	return nil
+}
+
+// GetBlockName returns the name of the MockProxy.
+func (m MockProxy) GetBlockName() string {
+	return m.name
+}
+
+func (m MockProxy) GetGroupName() string {
+	return "default"
+}
+
+// Mock implementation of IConnWrapper.
+type MockConnWrapper struct {
+	mock.Mock
+}
+
+func (m *MockConnWrapper) Conn() net.Conn {
+	args := m.Called()
+	conn, ok := args.Get(0).(net.Conn)
+	if !ok {
+		panic(fmt.Sprintf("expected net.Conn but got %T", args.Get(0)))
+	}
+	return conn
+}
+
+func (m *MockConnWrapper) UpgradeToTLS(upgrader UpgraderFunc) *gerr.GatewayDError {
+	args := m.Called(upgrader)
+	err, ok := args.Get(0).(*gerr.GatewayDError)
+	if !ok {
+		panic(fmt.Sprintf("expected *gerr.GatewayDError but got %T", args.Get(0)))
+	}
+	return err
+}
+
+func (m *MockConnWrapper) Close() error {
+	args := m.Called()
+	if err := args.Error(0); err != nil {
+		return fmt.Errorf("failed to close connection: %w", err)
+	}
+	return nil
+}
+
+func (m *MockConnWrapper) Write(data []byte) (int, error) {
+	args := m.Called(data)
+	return args.Int(0), args.Error(1)
+}
+
+func (m *MockConnWrapper) Read(data []byte) (int, error) {
+	args := m.Called(data)
+	return args.Int(0), args.Error(1)
+}
+
+func (m *MockConnWrapper) RemoteAddr() net.Addr {
+	args := m.Called()
+	addr, ok := args.Get(0).(net.Addr)
+	if !ok {
+		panic(fmt.Sprintf("expected net.Addr but got %T", args.Get(0)))
+	}
+	return addr
+}
+
+func (m *MockConnWrapper) LocalAddr() net.Addr {
+	args := m.Called()
+	addr, ok := args.Get(0).(net.Addr)
+	if !ok {
+		panic(fmt.Sprintf("expected net.Addr but got %T", args.Get(0)))
+	}
+	return addr
+}
+
+func (m *MockConnWrapper) IsTLSEnabled() bool {
+	args := m.Called()
+	return args.Bool(0)
 }
